@@ -26,16 +26,15 @@ _codes = {}
 @triton.jit
 def _nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, n_bytes,
                         BLOCK: tl.constexpr):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)  # индексы упакованных байтов
-    in_range = offs < n_bytes  # маска: не выходим за конец массива
-    packed = tl.load(packed_ptr + offs, mask=in_range, other=0).to(tl.int32)  # читаем байты
-    scale = tl.load(absmax_ptr + offs // 32, mask=in_range, other=0.0)  # 64 значения = 32 байта на один absmax
-    high = tl.load(code_ptr + (packed >> 4)) * scale  # старший ниббл -> значение
-    low = tl.load(code_ptr + (packed & 15)) * scale  # младший ниббл -> значение
-    pair = tl.arange(0, 2)[None, :]  # 0 = старшее значение, 1 = младшее; форма (1, 2)
-    vals = tl.where(pair == 0, high[:, None], low[:, None])  # собираем таблицу (BLOCK, 2)
-    out_offs = offs[:, None] * 2 + pair  # адреса идут подряд: 2*i, 2*i+1
-    tl.store(out_ptr + out_offs, vals.to(out_ptr.dtype.element_ty), mask=out_offs < n_out)  # одна скоалесцированная запись
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)  # index of the packed byte
+    in_range = offs < n_bytes
+    packed = tl.load(packed_ptr + offs, mask=in_range, other=0).to(tl.int32)
+    scale = tl.load(absmax_ptr + offs // (64 // 2), mask=in_range, other=0.0)  # 64 values = 32 bytes
+    high = tl.load(code_ptr + (packed >> 4)) * scale
+    low = tl.load(code_ptr + (packed & 15)) * scale
+    first = 2 * offs
+    tl.store(out_ptr + first, high.to(out_ptr.dtype.element_ty), mask=first < n_out)
+    tl.store(out_ptr + first + 1, low.to(out_ptr.dtype.element_ty), mask=first + 1 < n_out)
 
 
 def _code_table(device):

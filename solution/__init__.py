@@ -13,8 +13,10 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .patches import apply_all
 from .swiglu import patch_qwen2_mlp
 
 
 def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
+    apply_all()  # our fused loss / entropy / accuracy kernels (fused_loss.py, patches.py)
