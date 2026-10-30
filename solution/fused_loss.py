@@ -117,11 +117,17 @@ class _FusedCE(torch.autograd.Function):
 
 
 def lookup(logits):
-    """The per-token results of the forward pass that produced `logits`, or None."""
+    """The per-token results of the latest forward pass, if `logits` has its shape, else None.
+
+    The match is by shape, not by memory address: with fp16 training, accelerate hands the
+    trainer an fp32 COPY of the logits, so `outputs.logits` is a different tensor from the one
+    the loss saw. `_SIDE` is cleared before every forward pass (see patches.py), so what is in
+    it always belongs to the step that is running.
+    """
     if not _SIDE or not torch.is_tensor(logits) or logits.dim() != 3:
         return None
-    if (logits.data_ptr() == _SIDE["ptr"] and logits.numel() == _SIDE["numel"]
-            and logits.shape[-1] == _SIDE["vocab"] and logits.shape[0] == _SIDE["batch"]):
+    if (logits.shape[0] == _SIDE["batch"] and logits.shape[1] == _SIDE["length"]
+            and logits.shape[2] == _SIDE["vocab"]):
         return _SIDE
     return None
 

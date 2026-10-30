@@ -55,3 +55,26 @@ def test_fused_loss_matches_pytorch(dtype, shape, num_items):
     # exact ties between two logits can legitimately differ; allow a handful
     assert ((side["correct"] != 0) != ref_correct).sum().item() <= 1
     torch.testing.assert_close(logits.grad.float(), ref_logits.grad.float(), rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("shape", [(1536, 8960), (257, 1000)])
+def test_nf4_dequant_matches_bitsandbytes(shape):
+    import bitsandbytes.functional as BF
+    from bitsandbytes.backends.cuda import ops
+
+    from solution import nf4
+
+    torch.manual_seed(0)
+    weight = torch.randn(shape, device="cuda", dtype=torch.float16)
+    packed, state = BF.quantize_4bit(weight, blocksize=64, quant_type="nf4",
+                                     compress_statistics=True)
+    absmax = state.absmax
+    if state.nested:
+        absmax = BF.dequantize_blockwise(state.absmax, state.state2) + state.offset
+    absmax = absmax.float().contiguous()
+
+    expected = torch.empty(shape, dtype=torch.float16, device="cuda")
+    ops._dequantize_4bit_impl(packed, absmax, 64, "nf4", torch.float16, out=expected)
+    ours = torch.empty(shape, dtype=torch.float16, device="cuda")
+    nf4.dequantize_nf4(packed.contiguous(), absmax, ours)
+    torch.testing.assert_close(ours, expected, rtol=0, atol=0)

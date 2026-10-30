@@ -16,7 +16,7 @@ import sys
 
 import torch
 
-from . import fused_loss
+from . import fused_loss, nf4
 
 
 def _warn(what, exc):
@@ -49,6 +49,7 @@ def patch_trl_compute_loss():
                 and not getattr(self, "aux_loss_enabled", False))
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        fused_loss._SIDE.clear()  # whatever is cached must belong to the forward pass below
         if not fast_path_ok(self, inputs):
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
@@ -56,7 +57,6 @@ def patch_trl_compute_loss():
         inputs.pop("_prediction_loss_only", None)
         labels = inputs["labels"]
         inputs["use_cache"] = False
-        fused_loss._SIDE.clear()
         loss, outputs = super(trainer_cls, self).compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
 
@@ -112,8 +112,18 @@ def patch_soup_row_losses():
     rewind_hf.row_losses = row_losses
 
 
+def patch_nf4_dequant():
+    from bitsandbytes.backends.cuda import ops
+
+    original = ops._dequantize_4bit_impl
+    if getattr(original, "_is_fused", False):
+        return
+    ops._dequantize_4bit_impl = nf4.make_dequant(original)
+
+
 def apply_all():
-    for name, patch in (("transformers loss", patch_transformers_loss),
+    for name, patch in (("NF4 dequant", patch_nf4_dequant),
+                        ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),
                         ("Soup row_losses", patch_soup_row_losses)):
         try:
