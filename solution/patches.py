@@ -12,7 +12,9 @@
 Every patch is guarded: a missing or faked module (Soup's regression tests use some) is skipped.
 """
 
-import sys
+import sys 
+
+from collections.abc import Mapping
 
 import torch
 
@@ -128,9 +130,9 @@ def patch_qwen2_rmsnorm():
         return
     qwen2.Qwen2RMSNorm.forward = rmsnorm.make_forward(original) 
 
-def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
                         ("RMSNorm", patch_qwen2_rmsnorm),
+                        ("accelerate fp32 logits", patch_accelerate_fp32_logits),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),
                         ("Soup row_losses", patch_soup_row_losses)):

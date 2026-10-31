@@ -26,15 +26,16 @@ _codes = {}
 @triton.jit
 def _nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, n_bytes,
                         BLOCK: tl.constexpr):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)  # index of the packed byte
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_range = offs < n_bytes
     packed = tl.load(packed_ptr + offs, mask=in_range, other=0).to(tl.int32)
-    scale = tl.load(absmax_ptr + offs // (64 // 2), mask=in_range, other=0.0)  # 64 values = 32 bytes
+    scale = tl.load(absmax_ptr + offs // 32, mask=in_range, other=0.0)
     high = tl.load(code_ptr + (packed >> 4)) * scale
     low = tl.load(code_ptr + (packed & 15)) * scale
-    first = 2 * offs
-    tl.store(out_ptr + first, high.to(out_ptr.dtype.element_ty), mask=first < n_out)
-    tl.store(out_ptr + first + 1, low.to(out_ptr.dtype.element_ty), mask=first + 1 < n_out)
+    pair = tl.arange(0, 2)[None, :]
+    vals = tl.where(pair == 0, high[:, None], low[:, None])
+    out_offs = offs[:, None] * 2 + pair
+    tl.store(out_ptr + out_offs, vals.to(out_ptr.dtype.element_ty), mask=out_offs < n_out)
 
 
 def _code_table(device):
