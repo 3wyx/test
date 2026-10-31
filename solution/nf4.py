@@ -81,10 +81,10 @@ def _get_deq_scratch(shape, dtype, device):
 
 
 def _normalize_nf4_weight_layout(weight, quant_state):
-    # bitsandbytes passes transposed packed weights in some matmul calls. Ensure the
-    # dequantized tensor is interpreted in the same orientation that the caller expects.
+    """Match bitsandbytes' packed-weight layout when callers pass a transposed matrix."""
     weight = weight.contiguous()
     if weight.dim() == 2 and weight.shape == quant_state.shape:
+        # This is the common caller case: quant_w.t() in bitsandbytes matmul_4bit.
         if weight.stride(0) == 1 and weight.stride(1) == weight.shape[0]:
             return weight.t().contiguous()
     return weight
@@ -150,15 +150,15 @@ class TritonMatMul4Bit(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.save_for_backward(B)
 
-        # bitsandbytes' matmul_4bit takes the packed weight in the transposed orientation, so the
-        # correct low-level operation is A @ dequantized(B), not F.linear(A, dequantized(B)).
         B_norm = _normalize_nf4_weight_layout(B, quant_state)
         w_deq = _dequantize_nf4_scratch(B_norm, quant_state, dtype=A.dtype)
         ctx.w_deq = w_deq.detach().contiguous()
         bias_c = bias.to(A.dtype) if (bias is not None and bias.dtype != A.dtype) else bias
+
         output = torch.matmul(A, w_deq)
         if bias_c is not None:
             output = output + bias_c
+
         if out is not None:
             out.copy_(output)
             return out
