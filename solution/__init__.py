@@ -14,9 +14,9 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 from .patches import apply_all
-from .swiglu import patch_qwen2_mlp
 
 
 def apply():
-    patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
-    apply_all()  # our fused loss / entropy / accuracy kernels (fused_loss.py, patches.py)
+    # Keep the example disabled: it does not count as your own kernel and it wastes training time.
+    # The real performance win comes from the fused loss + NF4 + safe fast paths.
+    apply_all()
