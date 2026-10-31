@@ -184,7 +184,6 @@ def apply_all():
                         ("RMSNorm", patch_qwen2_rmsnorm),
                         ("decoder layer add+norm", patch_qwen2_decoder_layer),
                         ("RoPE", patch_qwen2_rope),
-                        ("LoRA addmm", patch_lora_forward),
                         ("accelerate fp32 logits", patch_accelerate_fp32_logits),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),
