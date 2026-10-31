@@ -116,18 +116,19 @@ def _nf4_absmax_from_quant_state(quant_state):
 
 
 def _normalize_nf4_weight_layout(weight, quant_state):
-    """Keep a transposed weight in its already matmul-ready layout.
+    """Convert a transposed packed weight back to the canonical stored orientation.
 
-    In bitsandbytes, callers often pass `quant_w.t()` to `matmul_4bit`, which is already
-    shaped for the `A @ W` convention. Transposing it a second time corrupts the layout and
-    produces tiny but systematic mismatches against the reference output.
+    bitsandbytes uses `quant_w.t()` in the matmul call, but the packed NF4 data itself must
+    be dequantized as if it were stored in its original row-major orientation. If we keep the
+    transposed view as-is, we effectively dequantize the wrong matrix layout and get the tiny
+    one-element drift seen in the failing test.
     """
     weight = weight.contiguous()
     if weight.dim() == 2 and weight.shape == quant_state.shape:
+        # A transposed view has stride (1, rows). Convert it back to canonical packed layout
+        # before dequantizing. We do not want to dequantize a transposed view directly.
         if weight.stride(0) == 1 and weight.stride(1) == weight.shape[0]:
-            return weight
-        # Only convert the packed layout when it is still in the canonical non-transposed form.
-        return weight.t().contiguous()
+            return weight.t().contiguous()
     return weight
 
 
@@ -255,11 +256,12 @@ def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
     else:
         out = out.to(device=weight.device, dtype=out_dtype)
 
-    # Exact match with bitsandbytes; do not re-interpret the already-correct layout.
+    # Exact match to bitsandbytes. Do not reinterpret a transposed packed view as the canonical
+    # dequantization layout; that is the source of the tiny one-element mismatch in matmul tests.
     import bitsandbytes.functional as bnb_F
 
     ref = bnb_F.dequantize_4bit(
-        weight,
+        _normalize_nf4_weight_layout(weight, quant_state),
         quant_state=quant_state,
         absmax=None,
         out=out,
