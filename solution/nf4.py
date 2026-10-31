@@ -42,11 +42,12 @@ def qwen2_nf4_dequant_kernel(
     hi_nib = (packed >> 4) & 0x0F
     lo_nib = packed & 0x0F
 
-    val_hi = tl.load(code_ptr + hi_nib, mask=byte_mask, other=0.0).to(tl.float32)
     val_lo = tl.load(code_ptr + lo_nib, mask=byte_mask, other=0.0).to(tl.float32)
+    val_hi = tl.load(code_ptr + hi_nib, mask=byte_mask, other=0.0).to(tl.float32)
 
     scale_2d = scale[:, None]
-    out_pair = tl.join(val_hi * scale_2d, val_lo * scale_2d)
+    # NF4 stores two values per byte: low nibble first, then high nibble.
+    out_pair = tl.join(val_lo * scale_2d, val_hi * scale_2d)
 
     out_elems_per_pid: tl.constexpr = BLOCKS_PER_PID * BLOCKSIZE_HALF * 2
     out_offs = pid * out_elems_per_pid + tl.arange(0, out_elems_per_pid)
@@ -123,8 +124,8 @@ def _dequantize_nf4_blockwise(weight, quant_state, dtype):
     hi = ((packed >> 4) & 0x0F).to(torch.long)
 
     vals = torch.empty(packed.numel() * 2, device=weight.device, dtype=dtype)
-    vals[0::2] = code[hi]
-    vals[1::2] = code[lo]
+    vals[0::2] = code[lo]
+    vals[1::2] = code[hi]
     vals = vals[:total].view(n_blocks, blocksize) * scales.view(-1, 1)
     return vals.reshape(out_shape)
 
