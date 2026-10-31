@@ -40,4 +40,6 @@ def test_compact_forward_matches_original():
     grad = model.embed_tokens.weight.grad.clone()
 
     torch.testing.assert_close(out[valid].float(), ref[valid].float(), rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(grad.float(), ref_grad.float(), rtol=5e-2, atol=5e-2)
+    err = (grad.float() - ref_grad.float()).abs().max().item()
+    scale = ref_grad.float().abs().max().item()
+    assert err <= 0.05 * scale
