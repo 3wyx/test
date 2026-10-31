@@ -18,7 +18,8 @@ NF4_CODE = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453
             0.07958029955625534, 0.16093020141506195, 0.24611230194568634, 0.33791524171829224,
             0.44070982933044434, 0.5626170039558105, 0.7229568362236999, 1.0)
 BLOCKSIZE = 64
-BLOCK = 1024  # packed bytes per program = 2048 output values
+BLOCK = 512
+NUM_WARPS = 8
 
 _codes = {}
 
@@ -46,12 +47,11 @@ def _code_table(device):
 
 
 def dequantize_nf4(packed, absmax, out):
-    """Write the fp16 / bf16 / fp32 expansion of `packed` into `out` (contiguous)."""
     n_out = out.numel()
     n_bytes = (n_out + 1) // 2
     grid = (triton.cdiv(n_bytes, BLOCK),)
     _nf4_dequant_kernel[grid](packed, absmax, _code_table(out.device), out, n_out, n_bytes,
-                              BLOCK=BLOCK)
+                              BLOCK=BLOCK, num_warps=NUM_WARPS)
 
 
 def make_dequant(original):
