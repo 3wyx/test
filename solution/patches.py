@@ -17,7 +17,7 @@ from collections.abc import Mapping
 
 import torch
 
-from . import fused_loss, nf4, rmsnorm
+from . import fused_loss, nf4, rmsnorm, rope
 
 
 def _warn(what, exc):
@@ -155,18 +155,19 @@ def patch_accelerate_fp32_logits():
     convert_to_fp32._is_fused = True
     acc_ops.convert_to_fp32 = convert_to_fp32
 
-def patch_qwen2_decoder_layer():
+def patch_qwen2_rope():
     from transformers.models.qwen2 import modeling_qwen2 as qwen2
 
-    original = qwen2.Qwen2DecoderLayer.forward
+    original = qwen2.apply_rotary_pos_emb
     if getattr(original, "_is_fused", False):
         return
-    qwen2.Qwen2DecoderLayer.forward = rmsnorm.make_layer_forward(original)
+    qwen2.apply_rotary_pos_emb = rope.make_rope(original)
 
 def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
                         ("RMSNorm", patch_qwen2_rmsnorm),
                         ("decoder layer add+norm", patch_qwen2_decoder_layer),
+                        ("RoPE", patch_qwen2_rope),
                         ("accelerate fp32 logits", patch_accelerate_fp32_logits),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),

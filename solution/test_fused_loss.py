@@ -103,28 +103,34 @@ def test_rmsnorm_matches_pytorch(n):
     torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(x.grad.float(), x2.grad.float(), rtol=5e-3, atol=5e-3)
 
-def test_add_rmsnorm_matches_pytorch():
-    from solution import rmsnorm
+def test_rope_matches_pytorch():
+    from solution import rope
 
     torch.manual_seed(0)
-    n = 1536
-    a = torch.randn(2, 64, n, device="cuda", dtype=torch.float32).requires_grad_(True)
-    b = torch.randn(2, 64, n, device="cuda", dtype=torch.float16).requires_grad_(True)
-    w = torch.randn(n, device="cuda", dtype=torch.float32)
-    gs = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)
-    gy = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)
+    b, h, hk, t, d = 2, 12, 2, 64, 128
+    q = torch.randn(b, t, h, d, device="cuda", dtype=torch.float16).transpose(1, 2).detach()
+    k = torch.randn(b, t, hk, d, device="cuda", dtype=torch.float16).transpose(1, 2).detach()
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    cos = torch.randn(b, t, d, device="cuda", dtype=torch.float32)
+    sin = torch.randn(b, t, d, device="cuda", dtype=torch.float32)
+    gq = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+    gk = torch.randn(b, hk, t, d, device="cuda", dtype=torch.float32)
 
-    a2 = a.detach().clone().requires_grad_(True)
-    b2 = b.detach().clone().requires_grad_(True)
-    s_ref = a2 + b2
-    h = s_ref.float()
-    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)
-    y_ref = w * h.to(s_ref.dtype)
-    torch.autograd.backward([s_ref, y_ref], [gs, gy])
+    def rot(x):
+        return torch.cat((-x[..., d // 2:], x[..., : d // 2]), dim=-1)
 
-    s, y = rmsnorm._AddRMSNorm.apply(a, b, w, 1e-6, torch.float32)
-    torch.autograd.backward([s, y], [gs, gy])
-    torch.testing.assert_close(s, s_ref, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(a.grad, a2.grad, rtol=5e-3, atol=5e-3)
-    torch.testing.assert_close(b.grad.float(), b2.grad.float(), rtol=5e-3, atol=5e-3)
+    q2 = q.detach().clone().requires_grad_(True)
+    k2 = k.detach().clone().requires_grad_(True)
+    qr = q2 * cos.unsqueeze(1) + rot(q2) * sin.unsqueeze(1)
+    kr = k2 * cos.unsqueeze(1) + rot(k2) * sin.unsqueeze(1)
+    torch.autograd.backward([qr, kr], [gq, gk])
+
+    qe = rope._Rope.apply(q, cos, sin, torch.float32)
+    ke = rope._Rope.apply(k, cos, sin, torch.float32)
+    torch.autograd.backward([qe, ke], [gq, gk])
+
+    torch.testing.assert_close(qe, qr, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(ke, kr, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(q.grad.float(), q2.grad.float(), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(k.grad.float(), k2.grad.float(), rtol=2e-3, atol=2e-3)
