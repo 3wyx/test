@@ -155,6 +155,14 @@ def patch_accelerate_fp32_logits():
     convert_to_fp32._is_fused = True
     acc_ops.convert_to_fp32 = convert_to_fp32
 
+def patch_qwen2_decoder_layer():
+    from transformers.models.qwen2 import modeling_qwen2 as qwen2
+
+    original = qwen2.Qwen2DecoderLayer.forward
+    if getattr(original, "_is_fused", False):
+        return
+    qwen2.Qwen2DecoderLayer.forward = rmsnorm.make_layer_forward(original)
+    
 def patch_qwen2_rope():
     from transformers.models.qwen2 import modeling_qwen2 as qwen2
 
