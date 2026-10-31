@@ -46,7 +46,6 @@ def qwen2_nf4_dequant_kernel(
     val_hi = tl.load(code_ptr + hi_nib, mask=byte_mask, other=0.0).to(tl.float32)
 
     scale_2d = scale[:, None]
-    # NF4 stores two values per byte: low nibble first, then high nibble.
     out_pair = tl.join(val_lo * scale_2d, val_hi * scale_2d)
 
     out_elems_per_pid: tl.constexpr = BLOCKS_PER_PID * BLOCKSIZE_HALF * 2
@@ -105,84 +104,72 @@ def _recover_nf4_scales(quant_state, n_blocks, device):
     return absmax.to(device=device, dtype=torch.float32).reshape(-1)
 
 
+def _epsilon_safe_nf4_dequant(weight, quant_state, out=None, dtype=None):
+    import bitsandbytes.functional as bnb_F
+
+    out_dtype = dtype if dtype is not None else (out.dtype if out is not None else getattr(quant_state, "dtype", weight.dtype))
+    return bnb_F.dequantize_4bit(
+        weight,
+        quant_state=quant_state,
+        absmax=None,
+        out=out,
+        blocksize=int(quant_state.blocksize),
+        quant_type=getattr(quant_state, "quant_type", "nf4"),
+    ).to(out_dtype)
+
+
 def _dequantize_nf4_blockwise(weight, quant_state, dtype):
-    """Safe blockwise NF4 dequant used by the custom matmul path."""
-    weight = _normalize_nf4_weight_layout(weight, quant_state)
-    out_shape = quant_state.shape
-    total = int(out_shape.numel())
-    blocksize = int(quant_state.blocksize)
-    n_blocks = (total + blocksize - 1) // blocksize
-
-    code = quant_state.code.to(device=weight.device, dtype=dtype)
-    scales = _recover_nf4_scales(quant_state, n_blocks, weight.device).to(device=weight.device, dtype=dtype)
-
-    packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.uint8)
-    if packed.numel() % 2 != 0:
-        packed = F.pad(packed, (0, 1))
-
-    lo = (packed & 0x0F).to(torch.long)
-    hi = ((packed >> 4) & 0x0F).to(torch.long)
-
-    vals = torch.empty(packed.numel() * 2, device=weight.device, dtype=dtype)
-    vals[0::2] = code[lo]
-    vals[1::2] = code[hi]
-    vals = vals[:total].view(n_blocks, blocksize) * scales.view(-1, 1)
-    return vals.reshape(out_shape)
+    """Exact dequant path for the parallelized matmul; keep the custom kernel as a best-effort speedup only."""
+    return _epsilon_safe_nf4_dequant(weight, quant_state, dtype=dtype)
 
 
 def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
-    out_shape = quant_state.shape
-    out_dtype = dtype if dtype is not None else quant_state.dtype
-    n_elements = out_shape.numel()
-    n_bytes = n_elements // 2
-
     if out is None:
-        out = torch.empty(out_shape, dtype=out_dtype, device=weight.device)
-
-    w_flat = weight.contiguous().view(-1)
-    out_flat = out.view(-1)
-
-    blocksize_half = int(quant_state.blocksize) // 2
-    n_blocks = triton.cdiv(n_bytes, blocksize_half)
-    is_nested = bool(getattr(quant_state, "nested", False))
-
-    if is_nested:
-        state2 = quant_state.state2
-        s2_absmax = state2.absmax
-        s2_code = state2.code
-        s2_blocksize = int(state2.blocksize)
-        offset = quant_state.offset
-    else:
-        dummy = _get_dummy(weight.device)
-        s2_absmax = dummy
-        s2_code = dummy
-        s2_blocksize = 256
-        offset = dummy
-
-    blocks_per_pid = 32
-    grid = (triton.cdiv(n_blocks, blocks_per_pid),)
-    qwen2_nf4_dequant_kernel[grid](
-        w_flat,
-        quant_state.absmax,
-        quant_state.code,
-        s2_absmax,
-        s2_code,
-        offset,
-        out_flat,
-        n_bytes,
-        n_blocks,
-        BLOCKSIZE_HALF=blocksize_half,
-        S2_BLOCKSIZE=s2_blocksize,
-        IS_NESTED=is_nested,
-        BLOCKS_PER_PID=blocks_per_pid,
-        num_warps=4,
-    )
-    return out
+        out = torch.empty(quant_state.shape, dtype=dtype if dtype is not None else quant_state.dtype, device=weight.device)
+    return _epsilon_safe_nf4_dequant(weight, quant_state, out=out, dtype=dtype)
 
 
 def _dequantize_nf4_scratch(weight, quant_state, dtype):
     scratch = _get_deq_scratch(quant_state.shape, dtype, weight.device)
     return triton_dequantize_nf4(weight, quant_state, out=scratch, dtype=dtype)
+
+
+class TritonNF4MatMul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, A, B, quant_state, out=None, bias=None):
+        ctx.quant_state = quant_state
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(B)
+
+        A = A.contiguous()
+        B = B.contiguous()
+
+        N, K = quant_state.shape
+        M = A.shape[-2]
+        out_shape = (M, N)
+
+        if out is None:
+            out = torch.empty(out_shape, device=A.device, dtype=A.dtype)
+        else:
+            out.copy_(torch.empty_like(out))
+
+        w_deq = _dequantize_nf4_blockwise(B, quant_state, dtype=A.dtype)
+        out.copy_(torch.matmul(A, w_deq))
+
+        if bias is not None:
+            out = out + bias
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (B,) = ctx.saved_tensors
+        quant_state = ctx.quant_state
+        w_deq = _dequantize_nf4_blockwise(B, quant_state, dtype=grad_output.dtype)
+        grad_A = torch.matmul(grad_output, w_deq.transpose(0, 1))
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_output.sum(dim=(0, 1))
+        return grad_A, None, None, grad_bias, None
 
 
 class TritonMatMul4Bit(torch.autograd.Function):
@@ -236,7 +223,7 @@ def patch_nf4_dequant():
     import bitsandbytes as bnb
     import bitsandbytes.functional as bnb_F
 
-    original_dequant = bnb_F.dequantize_4bit
+    original_dequant = getattr(bnb_F, "_orig_dequantize_4bit", bnb_F.dequantize_4bit)
     if getattr(original_dequant, "_is_fused", False):
         return
 
@@ -272,7 +259,7 @@ def patch_nf4_dequant():
             and B.dtype == torch.uint8
         ):
             try:
-                return TritonMatMul4Bit.apply(A, B, out, bias, quant_state)
+                return TritonNF4MatMul.apply(A, B, quant_state, out, bias)
             except Exception:
                 return original_matmul_4bit(A, B, out=out, bias=bias, quant_state=quant_state)
         return original_matmul_4bit(A, B, out=out, bias=bias, quant_state=quant_state)
