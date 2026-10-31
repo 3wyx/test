@@ -126,8 +126,6 @@ def _quantized_nf4_to_dense_blockwise(weight, quant_state, dtype=torch.float16):
     lo = (packed & 0x0F).to(torch.long)
     hi = ((packed >> 4) & 0x0F).to(torch.long)
 
-    flat = torch.empty(N * K, device=weight.device, dtype=dtype)
-    idx = torch.arange(K, device=weight.device) % 2
     vals = torch.empty(N, K // 2, 2, device=weight.device, dtype=dtype)
     vals[..., 0] = code[hi]
     vals[..., 1] = code[lo]
@@ -242,6 +240,30 @@ def _recover_nf4_scales(quant_state, n_blocks, device):
         offset = torch.as_tensor(float(offset), device=device, dtype=torch.float32)
         return s2_code[q_abs] * s2_abs[group_idx] + offset
     return absmax.to(device=device, dtype=torch.float32).reshape(-1)
+
+
+def _dequantize_nf4_blockwise(weight, quant_state, dtype):
+    weight = _normalize_nf4_weight_layout(weight, quant_state)
+    out_shape = quant_state.shape
+    total = int(out_shape.numel())
+    blocksize = int(quant_state.blocksize)
+    n_blocks = (total + blocksize - 1) // blocksize
+
+    code = quant_state.code.to(device=weight.device, dtype=dtype)
+    scales = _recover_nf4_scales(quant_state, n_blocks, weight.device).to(device=weight.device, dtype=dtype)
+
+    packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.uint8)
+    if packed.numel() % 2 != 0:
+        packed = F.pad(packed, (0, 1))
+
+    lo = (packed & 0x0F).to(torch.long)
+    hi = ((packed >> 4) & 0x0F).to(torch.long)
+
+    vals = torch.empty(packed.numel() * 2, device=weight.device, dtype=dtype)
+    vals[0::2] = code[hi]
+    vals[1::2] = code[lo]
+    vals = vals[:total].view(n_blocks, blocksize) * scales.view(-1, 1)
+    return vals.reshape(out_shape)
 
 
 def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
@@ -362,7 +384,7 @@ def patch_nf4_dequant():
             and B.is_cuda
             and B.dtype == torch.uint8
         ):
-            return TritonNF4MatMul.apply(A, B, quant_state, out, bias)
+            return TritonMatMul4Bit.apply(A, B, out, bias, quant_state)
         return original_matmul_4bit(A, B, out=out, bias=bias, quant_state=quant_state)
 
     bnb.matmul_4bit = fast_matmul_4bit
