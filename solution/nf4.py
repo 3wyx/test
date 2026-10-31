@@ -81,6 +81,16 @@ def _get_deq_scratch(shape, dtype, device):
     return buf[:numel].view(shape)
 
 
+def _normalize_nf4_weight_layout(weight, quant_state):
+    """Match bitsandbytes layout when callers pass a transposed quantized weight (e.g. quant_w.t())."""
+    if weight.dim() == 2 and weight.shape == quant_state.shape:
+        # A transposed but same-shaped matrix has stride (1, rows), which is the hallmark of
+        # the layout bitsandbytes uses when a weight is handed in as B.T during matmul.
+        if weight.stride(0) == 1 and weight.stride(1) == weight.shape[0]:
+            return weight.t().contiguous()
+    return weight.contiguous()
+
+
 def _recover_nf4_scales(quant_state, n_blocks, device):
     """Rebuild the per-block NF4 absmax using bitsandbytes-style nested-statistics logic."""
     absmax = quant_state.absmax
@@ -111,6 +121,7 @@ def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
     else:
         out = out.to(device=weight.device, dtype=out_dtype)
 
+    weight = _normalize_nf4_weight_layout(weight, quant_state)
     packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.int64)
     if packed.numel() * 2 < n_values:
         packed = F.pad(packed, (0, n_values // 2 - packed.numel()))
@@ -142,7 +153,8 @@ class TritonMatMul4Bit(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.save_for_backward(B)
 
-        w_deq = _dequantize_nf4_scratch(B, quant_state, dtype=A.dtype)
+        B_norm = _normalize_nf4_weight_layout(B, quant_state)
+        w_deq = _dequantize_nf4_scratch(B_norm, quant_state, dtype=A.dtype)
         ctx.w_deq = w_deq.detach().contiguous()
         bias_c = bias.to(A.dtype) if (bias is not None and bias.dtype != A.dtype) else bias
         output = F.linear(A, w_deq, bias_c)
@@ -160,7 +172,8 @@ class TritonMatMul4Bit(torch.autograd.Function):
             if ctx.w_deq is not None:
                 grad_A = torch.matmul(grad_output, ctx.w_deq)
             else:
-                w_deq = _dequantize_nf4_scratch(B, ctx.quant_state, dtype=grad_output.dtype)
+                B_norm = _normalize_nf4_weight_layout(B, ctx.quant_state)
+                w_deq = _dequantize_nf4_scratch(B_norm, ctx.quant_state, dtype=grad_output.dtype)
                 grad_A = torch.matmul(grad_output, w_deq)
         if ctx.has_bias and ctx.needs_input_grad[3]:
             grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
