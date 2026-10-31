@@ -102,3 +102,29 @@ def test_rmsnorm_matches_pytorch(n):
     assert y.dtype == y_ref.dtype
     torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(x.grad.float(), x2.grad.float(), rtol=5e-3, atol=5e-3)
+
+def test_add_rmsnorm_matches_pytorch():
+    from solution import rmsnorm
+
+    torch.manual_seed(0)
+    n = 1536
+    a = torch.randn(2, 64, n, device="cuda", dtype=torch.float32).requires_grad_(True)
+    b = torch.randn(2, 64, n, device="cuda", dtype=torch.float16).requires_grad_(True)
+    w = torch.randn(n, device="cuda", dtype=torch.float32)
+    gs = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)
+    gy = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)
+
+    a2 = a.detach().clone().requires_grad_(True)
+    b2 = b.detach().clone().requires_grad_(True)
+    s_ref = a2 + b2
+    h = s_ref.float()
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)
+    y_ref = w * h.to(s_ref.dtype)
+    torch.autograd.backward([s_ref, y_ref], [gs, gy])
+
+    s, y = rmsnorm._AddRMSNorm.apply(a, b, w, 1e-6, torch.float32)
+    torch.autograd.backward([s, y], [gs, gy])
+    torch.testing.assert_close(s, s_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(a.grad, a2.grad, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(b.grad.float(), b2.grad.float(), rtol=5e-3, atol=5e-3)
