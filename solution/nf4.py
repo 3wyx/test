@@ -18,8 +18,8 @@ NF4_CODE = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453
             0.07958029955625534, 0.16093020141506195, 0.24611230194568634, 0.33791524171829224,
             0.44070982933044434, 0.5626170039558105, 0.7229568362236999, 1.0)
 BLOCKSIZE = 64
-BLOCK = 1024
-NUM_WARPS = 4
+BLOCK = 2048
+NUM_WARPS = 8
 
 _codes = {}
 
@@ -30,11 +30,15 @@ def _nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, n_byte
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_range = offs < n_bytes
     packed = tl.load(packed_ptr + offs, mask=in_range, other=0).to(tl.int32)
-    scale = tl.load(absmax_ptr + offs // 32, mask=in_range, other=0.0)
-    high = tl.load(code_ptr + (packed >> 4)) * scale
-    low = tl.load(code_ptr + (packed & 15)) * scale
+    scales = tl.load(absmax_ptr + offs // 32, mask=in_range, other=0.0)
+
+    # Keep the arithmetic straightforward and cache-friendly for the T4 path:
+    # low/high nibble are expanded into 2 output values per packed byte.
+    hi = tl.load(code_ptr + (packed >> 4)) * scales
+    lo = tl.load(code_ptr + (packed & 15)) * scales
+
     pair = tl.arange(0, 2)[None, :]
-    vals = tl.where(pair == 0, high[:, None], low[:, None])
+    vals = tl.where(pair == 0, hi[:, None], lo[:, None])
     out_offs = offs[:, None] * 2 + pair
     tl.store(out_ptr + out_offs, vals.to(out_ptr.dtype.element_ty), mask=out_offs < n_out)
 
