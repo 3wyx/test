@@ -19,12 +19,14 @@ def make_forward(original):
         result = self.base_layer(x)
         scaling = self.scaling[name]
         hidden = lora_A(self.lora_dropout[name](x))
+
+        # Keep the fast path narrow: do not materialize extra intermediate tensors.
         if result.dtype != hidden.dtype:
             return result + lora_B(hidden) * scaling
-        flat = torch.addmm(result.reshape(-1, result.shape[-1]),
-                           hidden.reshape(-1, hidden.shape[-1]),
-                           lora_B.weight.t(), alpha=scaling)
-        return flat.view(result.shape)
+
+        out = result.reshape(-1, result.shape[-1])
+        hid = hidden.reshape(-1, hidden.shape[-1])
+        return torch.addmm(out, hid, lora_B.weight.t(), alpha=scaling).view(result.shape)
 
     forward._is_fused = True
     return forward
