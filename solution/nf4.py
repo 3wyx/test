@@ -67,10 +67,14 @@ def _block_scales(quant_state, device):
     n_blocks = absmax.numel()
     scales = torch.empty(n_blocks, dtype=torch.float32, device=device)
     offset = torch.as_tensor(quant_state.offset, dtype=torch.float32, device=device).reshape(1)
-    _nested_scales_kernel[(triton.cdiv(n_blocks, 1024),)](
-        absmax.contiguous(), state2.code.to(torch.float32).contiguous(),
-        state2.absmax.to(torch.float32).contiguous(), offset, scales, n_blocks,
-        S2_BLOCKSIZE=int(state2.blocksize), BLOCK=1024)
+    args = (absmax.contiguous(), state2.code.to(torch.float32).contiguous(),
+            state2.absmax.to(torch.float32).contiguous(), offset, scales, n_blocks)
+    grid = (triton.cdiv(n_blocks, 1024),)
+    try:
+        _nested_scales_kernel[grid](*args, S2_BLOCKSIZE=int(state2.blocksize), BLOCK=1024,
+                                    enable_fp_fusion=False)
+    except Exception:
+        _nested_scales_kernel[grid](*args, S2_BLOCKSIZE=int(state2.blocksize), BLOCK=1024)
     return scales
 
 
