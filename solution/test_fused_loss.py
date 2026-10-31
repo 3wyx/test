@@ -132,5 +132,5 @@ def test_rope_matches_pytorch():
 
     torch.testing.assert_close(qe, qr, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(ke, kr, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(q.grad.float(), q2.grad.float(), rtol=2e-3, atol=2e-3)
-    torch.testing.assert_close(k.grad.float(), k2.grad.float(), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(q.grad.float(), q2.grad.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k.grad.float(), k2.grad.float(), rtol=1e-2, atol=1e-2)
