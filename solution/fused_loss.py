@@ -109,7 +109,7 @@ class _FusedCE(torch.autograd.Function):
     def backward(ctx, grad_out):
         logits, targets, lse, denom = ctx.saved_tensors
         n, vocab = logits.shape
-        dlogits = torch.empty_like(logits)
+        dlogits = logits
         scale = (grad_out.to(torch.float32) / denom).reshape(1).contiguous()
         _fused_ce_bwd_kernel[(n,)](logits, dlogits, targets, lse, scale, vocab, logits.stride(0),
                                    BLOCK=BLOCK, num_warps=NUM_WARPS)
