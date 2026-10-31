@@ -60,7 +60,6 @@ def qwen2_nf4_dequant_kernel(
 
 _DUMMY_TENSOR = None
 _DEQ_SCRATCH = {}
-# Smaller lower-bound scratch: enough for the current tile, not an oversized full-matrix workspace.
 _SCRATCH_MIN = 256 * 1024
 
 
@@ -82,17 +81,16 @@ def _get_deq_scratch(shape, dtype, device):
 
 
 def _normalize_nf4_weight_layout(weight, quant_state):
-    """Match bitsandbytes layout when callers pass a transposed quantized weight (e.g. quant_w.t())."""
+    # bitsandbytes passes transposed packed weights in some matmul calls. Ensure the
+    # dequantized tensor is interpreted in the same orientation that the caller expects.
+    weight = weight.contiguous()
     if weight.dim() == 2 and weight.shape == quant_state.shape:
-        # A transposed but same-shaped matrix has stride (1, rows), which is the hallmark of
-        # the layout bitsandbytes uses when a weight is handed in as B.T during matmul.
         if weight.stride(0) == 1 and weight.stride(1) == weight.shape[0]:
             return weight.t().contiguous()
-    return weight.contiguous()
+    return weight
 
 
 def _recover_nf4_scales(quant_state, n_blocks, device):
-    """Rebuild the per-block NF4 absmax using bitsandbytes-style nested-statistics logic."""
     absmax = quant_state.absmax
     if getattr(quant_state, "nested", False):
         state2 = quant_state.state2
@@ -109,7 +107,6 @@ def _recover_nf4_scales(quant_state, n_blocks, device):
 
 
 def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
-    """Dequantize NF4 weights into the same layout as bitsandbytes, without materializing a huge temporary matrix."""
     out_shape = quant_state.shape
     out_dtype = dtype if dtype is not None else quant_state.dtype
     n_values = int(out_shape.numel())
@@ -153,11 +150,15 @@ class TritonMatMul4Bit(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.save_for_backward(B)
 
+        # bitsandbytes' matmul_4bit takes the packed weight in the transposed orientation, so the
+        # correct low-level operation is A @ dequantized(B), not F.linear(A, dequantized(B)).
         B_norm = _normalize_nf4_weight_layout(B, quant_state)
         w_deq = _dequantize_nf4_scratch(B_norm, quant_state, dtype=A.dtype)
         ctx.w_deq = w_deq.detach().contiguous()
         bias_c = bias.to(A.dtype) if (bias is not None and bias.dtype != A.dtype) else bias
-        output = F.linear(A, w_deq, bias_c)
+        output = torch.matmul(A, w_deq)
+        if bias_c is not None:
+            output = output + bias_c
         if out is not None:
             out.copy_(output)
             return out
@@ -170,11 +171,11 @@ class TritonMatMul4Bit(torch.autograd.Function):
         grad_bias = None
         if ctx.needs_input_grad[0]:
             if ctx.w_deq is not None:
-                grad_A = torch.matmul(grad_output, ctx.w_deq)
+                grad_A = torch.matmul(grad_output, ctx.w_deq.transpose(-1, -2))
             else:
                 B_norm = _normalize_nf4_weight_layout(B, ctx.quant_state)
                 w_deq = _dequantize_nf4_scratch(B_norm, ctx.quant_state, dtype=grad_output.dtype)
-                grad_A = torch.matmul(grad_output, w_deq)
+                grad_A = torch.matmul(grad_output, w_deq.transpose(-1, -2))
         if ctx.has_bias and ctx.needs_input_grad[3]:
             grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
         return grad_A, None, None, grad_bias, None
