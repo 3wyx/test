@@ -60,7 +60,9 @@ def qwen2_nf4_dequant_kernel(
 
 _DUMMY_TENSOR = None
 _DEQ_SCRATCH = {}
-_SCRATCH_MIN = 8960 * 1536
+# Much smaller lower-bound buffer: exact current weight size is usually enough;
+# we do not preallocate a huge scratch buffer for every tensor.
+_SCRATCH_MIN = 1024 * 1024
 
 
 def _get_dummy(device):
@@ -142,7 +144,10 @@ class TritonMatMul4Bit(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.save_for_backward(B)
 
+        # Reuse the dequantized weight inside the same autograd graph instead of
+        # reconstructing it again during backward.
         w_deq = _dequantize_nf4_scratch(B, quant_state, dtype=A.dtype)
+        ctx.w_deq = w_deq.detach()
         bias_c = bias.to(A.dtype) if (bias is not None and bias.dtype != A.dtype) else bias
         output = F.linear(A, w_deq, bias_c)
         if out is not None:
@@ -156,8 +161,11 @@ class TritonMatMul4Bit(torch.autograd.Function):
         grad_A = None
         grad_bias = None
         if ctx.needs_input_grad[0]:
-            w_deq = _dequantize_nf4_scratch(B, ctx.quant_state, dtype=grad_output.dtype)
-            grad_A = torch.matmul(grad_output, w_deq)
+            if ctx.w_deq is not None:
+                grad_A = torch.matmul(grad_output, ctx.w_deq)
+            else:
+                w_deq = _dequantize_nf4_scratch(B, ctx.quant_state, dtype=grad_output.dtype)
+                grad_A = torch.matmul(grad_output, w_deq)
         if ctx.has_bias and ctx.needs_input_grad[3]:
             grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
         return grad_A, None, None, grad_bias, None
