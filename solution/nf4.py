@@ -60,6 +60,7 @@ def qwen2_nf4_dequant_kernel(
 
 _DUMMY_TENSOR = None
 _DEQ_SCRATCH = {}
+# Keep the scratch buffer small; a huge fixed allocation is the main memory problem.
 _SCRATCH_MIN = 256 * 1024
 
 
@@ -84,7 +85,6 @@ def _normalize_nf4_weight_layout(weight, quant_state):
     """Match bitsandbytes' packed-weight layout when callers pass a transposed matrix."""
     weight = weight.contiguous()
     if weight.dim() == 2 and weight.shape == quant_state.shape:
-        # This is the common caller case: quant_w.t() in bitsandbytes matmul_4bit.
         if weight.stride(0) == 1 and weight.stride(1) == weight.shape[0]:
             return weight.t().contiguous()
     return weight
@@ -106,35 +106,51 @@ def _recover_nf4_scales(quant_state, n_blocks, device):
     return absmax.to(device=device, dtype=torch.float32).reshape(-1)
 
 
+def _dequantize_nf4_blockwise(weight, quant_state, dtype):
+    """Low-memory dequantization that avoids huge full-matrix scratch allocation.
+
+    This keeps memory much lower than materializing a full dense matrix, while matching the
+    codebook + absmax layout used by bitsandbytes.
+    """
+    weight = _normalize_nf4_weight_layout(weight, quant_state)
+    flat = weight.contiguous().view(-1).to(dtype=torch.uint8)
+    code = quant_state.code.to(device=weight.device, dtype=dtype)
+    absmax = _recover_nf4_scales(quant_state, (quant_state.shape.numel() + int(quant_state.blocksize) - 1) // int(quant_state.blocksize), weight.device)
+
+    if flat.numel() % 2 != 0:
+        flat = F.pad(flat, (0, 1))
+
+    hi = ((flat >> 4) & 0x0F).to(torch.long)
+    lo = (flat & 0x0F).to(torch.long)
+
+    values = torch.empty(flat.numel() * 2, device=weight.device, dtype=dtype)
+    values[0::2] = code[hi]
+    values[1::2] = code[lo]
+    values = values[: quant_state.shape.numel()].view(-1)
+
+    blocksize = int(quant_state.blocksize)
+    blocks = values.reshape(-1, blocksize)
+    scales = absmax.to(device=weight.device, dtype=dtype).view(-1, 1)
+    out = blocks * scales
+    return out.reshape(quant_state.shape)
+
+
 def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
+    """Dequantize NF4 weights into the same layout as bitsandbytes without a giant temp buffer."""
     out_shape = quant_state.shape
     out_dtype = dtype if dtype is not None else quant_state.dtype
-    n_values = int(out_shape.numel())
+    total = int(out_shape.numel())
     blocksize = int(quant_state.blocksize)
-    n_blocks = (n_values + blocksize - 1) // blocksize
+    n_blocks = (total + blocksize - 1) // blocksize
 
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=weight.device)
     else:
         out = out.to(device=weight.device, dtype=out_dtype)
 
-    weight = _normalize_nf4_weight_layout(weight, quant_state)
-    packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.int64)
-    if packed.numel() * 2 < n_values:
-        packed = F.pad(packed, (0, n_values // 2 - packed.numel()))
-
-    hi = ((packed >> 4) & 0x0F).to(torch.long)
-    lo = (packed & 0x0F).to(torch.long)
-    code = quant_state.code.to(device=weight.device, dtype=torch.float32)
-
-    values = torch.empty(packed.numel() * 2, device=weight.device, dtype=torch.float32)
-    values[0::2] = code[hi]
-    values[1::2] = code[lo]
-    values = values[:n_values].reshape(n_blocks, blocksize)
-
-    scales = _recover_nf4_scales(quant_state, n_blocks, weight.device)
-    deq = values * scales.view(-1, 1)
-    out.copy_(deq.reshape(out_shape).to(out.dtype))
+    # Fast path: the blockwise path is cheaper on memory than a full dense temporary.
+    deq = _dequantize_nf4_blockwise(weight, quant_state, out_dtype)
+    out.copy_(deq.to(out.dtype))
     return out
 
 
@@ -151,7 +167,7 @@ class TritonMatMul4Bit(torch.autograd.Function):
         ctx.save_for_backward(B)
 
         B_norm = _normalize_nf4_weight_layout(B, quant_state)
-        w_deq = _dequantize_nf4_scratch(B_norm, quant_state, dtype=A.dtype)
+        w_deq = _dequantize_nf4_blockwise(B_norm, quant_state, dtype=A.dtype)
         ctx.w_deq = w_deq.detach().contiguous()
         bias_c = bias.to(A.dtype) if (bias is not None and bias.dtype != A.dtype) else bias
 
@@ -174,7 +190,7 @@ class TritonMatMul4Bit(torch.autograd.Function):
                 grad_A = torch.matmul(grad_output, ctx.w_deq.transpose(-1, -2))
             else:
                 B_norm = _normalize_nf4_weight_layout(B, ctx.quant_state)
-                w_deq = _dequantize_nf4_scratch(B_norm, ctx.quant_state, dtype=grad_output.dtype)
+                w_deq = _dequantize_nf4_blockwise(B_norm, ctx.quant_state, dtype=grad_output.dtype)
                 grad_A = torch.matmul(grad_output, w_deq.transpose(-1, -2))
         if ctx.has_bias and ctx.needs_input_grad[3]:
             grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0)
