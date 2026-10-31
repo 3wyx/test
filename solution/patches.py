@@ -12,8 +12,7 @@
 Every patch is guarded: a missing or faked module (Soup's regression tests use some) is skipped.
 """
 
-import sys 
-
+import sys
 from collections.abc import Mapping
 
 import torch
@@ -122,14 +121,42 @@ def patch_nf4_dequant():
         return
     ops._dequantize_4bit_impl = nf4.make_dequant(original)
 
+
 def patch_qwen2_rmsnorm():
     from transformers.models.qwen2 import modeling_qwen2 as qwen2
 
-    original = qwen2.Qwen2RMSNorm.forward 
+    original = qwen2.Qwen2RMSNorm.forward
     if getattr(original, "_is_fused", False):
         return
-    qwen2.Qwen2RMSNorm.forward = rmsnorm.make_forward(original) 
+    qwen2.Qwen2RMSNorm.forward = rmsnorm.make_forward(original)
 
+
+def patch_accelerate_fp32_logits():
+    from accelerate.utils import operations as acc_ops
+
+    original = acc_ops.convert_to_fp32
+    if getattr(original, "_is_fused", False):
+        return
+
+    def convert_to_fp32(tensor):
+        logits = tensor.get("logits") if isinstance(tensor, Mapping) else None
+        keep = (torch.is_tensor(logits) and logits.dtype == torch.float16
+                and fused_loss.lookup(logits) is not None)
+        if not keep:
+            return original(tensor)
+        try:
+            rest = type(tensor)(**{k: v for k, v in tensor.items() if k != "logits"})
+            out = original(rest)
+            out["logits"] = logits
+            return out
+        except Exception:
+            return original(tensor)
+
+    convert_to_fp32._is_fused = True
+    acc_ops.convert_to_fp32 = convert_to_fp32
+
+
+def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
                         ("RMSNorm", patch_qwen2_rmsnorm),
                         ("accelerate fp32 logits", patch_accelerate_fp32_logits),
@@ -138,5 +165,5 @@ def patch_qwen2_rmsnorm():
                         ("Soup row_losses", patch_soup_row_losses)):
         try:
             patch()
-        except Exception as exc:  # noqa: BLE001 - a missing / faked module must not break Soup
+        except Exception as exc:
             _warn(name, exc)
