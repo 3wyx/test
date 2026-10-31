@@ -155,6 +155,7 @@ def patch_accelerate_fp32_logits():
     convert_to_fp32._is_fused = True
     acc_ops.convert_to_fp32 = convert_to_fp32
 
+
 def patch_qwen2_decoder_layer():
     from transformers.models.qwen2 import modeling_qwen2 as qwen2
 
@@ -162,7 +163,8 @@ def patch_qwen2_decoder_layer():
     if getattr(original, "_is_fused", False):
         return
     qwen2.Qwen2DecoderLayer.forward = rmsnorm.make_layer_forward(original)
-    
+
+
 def patch_qwen2_rope():
     from transformers.models.qwen2 import modeling_qwen2 as qwen2
 
@@ -171,6 +173,7 @@ def patch_qwen2_rope():
         return
     qwen2.apply_rotary_pos_emb = rope.make_rope(original)
 
+
 def patch_lora_forward():
     from peft.tuners.lora import bnb as peft_bnb
 
@@ -178,12 +181,14 @@ def patch_lora_forward():
     if getattr(original, "_is_fused", False):
         return
     peft_bnb.Linear4bit.forward = lora_fast.make_forward(original)
-   
+
+
 def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
                         ("RMSNorm", patch_qwen2_rmsnorm),
                         ("decoder layer add+norm", patch_qwen2_decoder_layer),
                         ("RoPE", patch_qwen2_rope),
+                        ("LoRA fast path", patch_lora_forward),
                         ("accelerate fp32 logits", patch_accelerate_fp32_logits),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),
