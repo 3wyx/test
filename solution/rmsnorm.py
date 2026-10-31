@@ -40,49 +40,51 @@ def _rmsnorm_bwd_kernel(x_ptr, w_ptr, g_ptr, rstd_ptr, dx_ptr, N, BLOCK: tl.cons
 
 class _RMSNorm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, eps):
-        shape = x.shape  # запоминаем исходную форму
-        n = shape[-1]  # размер скрытого слоя
-        x2 = x.reshape(-1, n).contiguous()  # плоская матрица (строки, n)
-        rows = x2.shape[0]  # число строк
-        out_dtype = torch.promote_types(x.dtype, weight.dtype)  # тип выхода как у оригинала (fp32 при fp32-весе)
-        y = torch.empty((rows, n), dtype=out_dtype, device=x.device)  # буфер результата
-        rstd = torch.empty(rows, dtype=torch.float32, device=x.device)  # буфер rstd
-        block = triton.next_power_of_2(n)  # степень двойки >= n
-        warps = 8 if block >= 4096 else 4  # число варпов
+    def forward(ctx, x, weight, eps, out_dtype=None):
+        shape = x.shape
+        n = shape[-1]
+        x2 = x.reshape(-1, n).contiguous()
+        rows = x2.shape[0]
+        if out_dtype is None:
+            out_dtype = torch.promote_types(x.dtype, weight.dtype)
+        y = torch.empty((rows, n), dtype=out_dtype, device=x.device)
+        rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
+        block = triton.next_power_of_2(n)
+        warps = 8 if block >= 4096 else 4
         _rmsnorm_fwd_kernel[(rows,)](x2, weight.contiguous(), y, rstd, n, eps,
-                                     BLOCK=block, num_warps=warps)  # запуск
-        ctx.save_for_backward(x2, weight, rstd)  # сохраняем для backward
-        ctx.shape = shape  # форма для возврата градиента
-        return y.view(shape)  # возвращаем в исходной форме
+                                     BLOCK=block, num_warps=warps)
+        ctx.save_for_backward(x2, weight, rstd)
+        ctx.shape = shape
+        return y.view(shape)
 
     @staticmethod
     def backward(ctx, grad_out):
-        x2, weight, rstd = ctx.saved_tensors  # достаём сохранённое
-        rows, n = x2.shape  # размеры
-        g = grad_out.reshape(-1, n).contiguous()  # градиент как плоская матрица
-        dx = torch.empty_like(x2)  # градиент входа в типе входа
-        block = triton.next_power_of_2(n)  # степень двойки
-        warps = 8 if block >= 4096 else 4  # варпы
+        x2, weight, rstd = ctx.saved_tensors
+        rows, n = x2.shape
+        g = grad_out.reshape(-1, n).contiguous()
+        dx = torch.empty_like(x2)
+        block = triton.next_power_of_2(n)
+        warps = 8 if block >= 4096 else 4
         _rmsnorm_bwd_kernel[(rows,)](x2, weight.contiguous(), g, rstd, dx, n,
-                                     BLOCK=block, num_warps=warps)  # запуск
-        dw = None  # градиент веса по умолчанию не нужен
-        if ctx.needs_input_grad[1]:  # вес нормы обычно заморожен, но на всякий случай
-            xn = (x2.float() * rstd[:, None]).to(x2.dtype).float()  # округлённый xhat, как в forward
-            dw = (g.float() * xn).sum(0).to(weight.dtype)  # сумма по строкам
-        return dx.view(ctx.shape), dw, None  # градиенты для x, weight, eps
+                                     BLOCK=block, num_warps=warps)
+        dw = None
+        if ctx.needs_input_grad[1]:
+            xn = (x2.float() * rstd[:, None]).to(x2.dtype).float()
+            dw = (g.float() * xn).sum(0).to(weight.dtype)
+        return dx.view(ctx.shape), dw, None, None
 
 
 def make_forward(original):
-    """Замена Qwen2RMSNorm.forward (та же сигнатура)."""
-
     def forward(self, hidden_states):
-        w = self.weight  # вес нормы
+        w = self.weight
         if (hidden_states.is_cuda and w.is_cuda
                 and hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                and w.dtype in (torch.float16, torch.bfloat16, torch.float32)):  # условия быстрого пути
-            return _RMSNorm.apply(hidden_states, w, self.variance_epsilon)  # наш кернел
-        return original(self, hidden_states)  # иначе обычный код
+                and w.dtype in (torch.float16, torch.bfloat16, torch.float32)):
+            out_dtype = torch.promote_types(hidden_states.dtype, w.dtype)
+            if out_dtype == torch.float32 and torch.is_autocast_enabled():
+                out_dtype = torch.get_autocast_dtype("cuda")
+            return _RMSNorm.apply(hidden_states, w, self.variance_epsilon, out_dtype)
+        return original(self, hidden_states)
 
-    forward._is_fused = True  # метка, чтобы не патчить дважды
+    forward._is_fused = True
     return forward
