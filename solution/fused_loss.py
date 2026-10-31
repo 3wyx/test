@@ -96,13 +96,17 @@ class _FusedCE(torch.autograd.Function):
         tokloss = torch.empty(n, dtype=torch.float32, device=device)
         entropy = torch.empty(n, dtype=torch.float32, device=device)
         correct = torch.empty(n, dtype=torch.int8, device=device)
+
         _fused_ce_fwd_kernel[(n,)](logits, targets, lse, tokloss, entropy, correct, vocab,
                                     logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
+
+        # Keep the cached metadata minimal and safe: only values reused by TRL/Soup metrics.
         _SIDE.clear()
         _SIDE.update(batch=batch, length=length, vocab=vocab,
                      tokloss=tokloss.view(batch, length),
                      entropy=entropy.view(batch, length),
                      correct=correct.view(batch, length))
+
         ctx.save_for_backward(logits, targets, lse)
         ctx.denom = float(denom)
         return tokloss.sum() / denom
@@ -113,8 +117,9 @@ class _FusedCE(torch.autograd.Function):
         n, vocab = logits.shape
         dlogits = torch.empty_like(logits)
         scale = grad_out.to(torch.float32) / ctx.denom
-        _fused_ce_bwd_kernel[(n,)](logits, dlogits, targets, lse, scale.reshape(1).contiguous(),
-                                    vocab, logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
+        scale = scale.reshape(1).contiguous()
+        _fused_ce_bwd_kernel[(n,)](logits, dlogits, targets, lse, scale, vocab, logits.stride(0),
+                                    BLOCK=BLOCK, num_warps=NUM_WARPS)
         return dlogits, None, None, None, None
 
 
