@@ -16,7 +16,7 @@ import sys
 
 import torch
 
-from . import fused_loss, nf4
+from . import fused_loss, nf4, rmsnorm
 
 
 def _warn(what, exc):
@@ -120,9 +120,17 @@ def patch_nf4_dequant():
         return
     ops._dequantize_4bit_impl = nf4.make_dequant(original)
 
+def patch_qwen2_rmsnorm():
+    from transformers.models.qwen2 import modeling_qwen2 as qwen2
+
+    original = qwen2.Qwen2RMSNorm.forward 
+    if getattr(original, "_is_fused", False):
+        return
+    qwen2.Qwen2RMSNorm.forward = rmsnorm.make_forward(original) 
 
 def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
+                        ("RMSNorm", patch_qwen2_rmsnorm),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),
                         ("Soup row_losses", patch_soup_row_losses)):

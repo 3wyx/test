@@ -78,3 +78,27 @@ def test_nf4_dequant_matches_bitsandbytes(shape):
     ours = torch.empty(shape, dtype=torch.float16, device="cuda")
     nf4.dequantize_nf4(packed.contiguous(), absmax, ours)
     torch.testing.assert_close(ours, expected, rtol=0, atol=0)
+
+@pytest.mark.parametrize("n", [1536, 1000])
+def test_rmsnorm_matches_pytorch(n):
+    from solution import rmsnorm
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 64, n, device="cuda", dtype=torch.float16).requires_grad_(True)  # fp16 вход
+    w = torch.randn(n, device="cuda", dtype=torch.float32)  # fp32 вес, как в обучении
+    g = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)  # градиент выхода
+
+    def ref(h):  # оригинальная формула Qwen2RMSNorm
+        d = h.dtype
+        h32 = h.float()
+        h32 = h32 * torch.rsqrt(h32.pow(2).mean(-1, keepdim=True) + 1e-6)
+        return w * h32.to(d)
+
+    x2 = x.detach().clone().requires_grad_(True)
+    y_ref = ref(x2)
+    y_ref.backward(g)
+    y = rmsnorm._RMSNorm.apply(x, w, 1e-6)
+    y.backward(g)
+    assert y.dtype == y_ref.dtype
+    torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(x.grad.float(), x2.grad.float(), rtol=5e-3, atol=5e-3)
