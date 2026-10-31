@@ -1,4 +1,4 @@
-"""Where the fused loss (fused_loss.py) is plugged into transformers, TRL and Soup.
+"""Where our fused kernels are plugged into transformers, TRL, accelerate, bitsandbytes and Soup.
 
 1. transformers: LOSS_MAPPING["ForCausalLM"] -> our loss (one kernel pass instead of an fp32
    copy + cross-entropy + softmax gradient buffers).
@@ -8,6 +8,8 @@
    It falls back to TRL's own code whenever its assumptions do not hold.
 3. Soup rewind_hf.row_losses: the per-row losses for rewind.jsonl are summed from the same
    per-token results instead of a cross-entropy per row.
+4. bitsandbytes NF4 dequantization, Qwen2 RMSNorm, add + RMSNorm in the decoder layer and RoPE
+   are replaced by our Triton kernels; accelerate's fp32 copy of the logits is skipped.
 
 Every patch is guarded: a missing or faked module (Soup's regression tests use some) is skipped.
 """
@@ -17,7 +19,7 @@ from collections.abc import Mapping
 
 import torch
 
-from . import fused_loss, lora_fast, nf4, rmsnorm, rope
+from . import fused_loss, nf4, rmsnorm, rope
 
 
 def _warn(what, exc):
@@ -50,7 +52,7 @@ def patch_trl_compute_loss():
                 and not getattr(self, "aux_loss_enabled", False))
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        fused_loss._SIDE.clear()  # whatever is cached must belong to the forward pass below
+        fused_loss._SIDE.clear()
         if not fast_path_ok(self, inputs):
             return original(self, model, inputs, return_outputs=return_outputs,
                             num_items_in_batch=num_items_in_batch)
@@ -69,7 +71,7 @@ def patch_trl_compute_loss():
                 valid = labels[:, 1:] != -100
                 correct_tokens = ((side["correct"][:, :-1] != 0) & valid).sum()
                 total_tokens = valid.sum()
-            else:  # not our loss path: do what TRL does, without the contiguous copy
+            else:
                 per_token_entropy = sft_module.entropy_from_logits(outputs.logits)
                 predictions = outputs.logits[:, :-1, :].argmax(dim=-1)
                 valid = labels[:, 1:] != -100
@@ -174,21 +176,11 @@ def patch_qwen2_rope():
     qwen2.apply_rotary_pos_emb = rope.make_rope(original)
 
 
-def patch_lora_forward():
-    from peft.tuners.lora import bnb as peft_bnb
-
-    original = peft_bnb.Linear4bit.forward
-    if getattr(original, "_is_fused", False):
-        return
-    peft_bnb.Linear4bit.forward = lora_fast.make_forward(original)
-
-
 def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
                         ("RMSNorm", patch_qwen2_rmsnorm),
                         ("decoder layer add+norm", patch_qwen2_decoder_layer),
                         ("RoPE", patch_qwen2_rope),
-                        ("LoRA fast path", patch_lora_forward),
                         ("accelerate fp32 logits", patch_accelerate_fp32_logits),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),

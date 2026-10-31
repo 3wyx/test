@@ -1,4 +1,4 @@
-"""Our fused loss kernels against plain PyTorch: loss, gradient, entropy, accuracy, per-token loss.
+"""Our fused kernels against plain PyTorch: loss, gradient, entropy, accuracy, NF4, RMSNorm, RoPE.
 
 Run on a GPU: `python -m pytest solution -q`.
 """
@@ -79,16 +79,17 @@ def test_nf4_dequant_matches_bitsandbytes(shape):
     nf4.dequantize_nf4(packed.contiguous(), absmax, ours)
     torch.testing.assert_close(ours, expected, rtol=0, atol=0)
 
+
 @pytest.mark.parametrize("n", [1536, 1000])
 def test_rmsnorm_matches_pytorch(n):
     from solution import rmsnorm
 
     torch.manual_seed(0)
-    x = torch.randn(2, 64, n, device="cuda", dtype=torch.float16).requires_grad_(True)  # fp16 вход
-    w = torch.randn(n, device="cuda", dtype=torch.float32)  # fp32 вес, как в обучении
-    g = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)  # градиент выхода
+    x = torch.randn(2, 64, n, device="cuda", dtype=torch.float16).requires_grad_(True)
+    w = torch.randn(n, device="cuda", dtype=torch.float32)
+    g = torch.randn(2, 64, n, device="cuda", dtype=torch.float32)
 
-    def ref(h):  # оригинальная формула Qwen2RMSNorm
+    def ref(h):
         d = h.dtype
         h32 = h.float()
         h32 = h32 * torch.rsqrt(h32.pow(2).mean(-1, keepdim=True) + 1e-6)
@@ -102,6 +103,7 @@ def test_rmsnorm_matches_pytorch(n):
     assert y.dtype == y_ref.dtype
     torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(x.grad.float(), x2.grad.float(), rtol=5e-3, atol=5e-3)
+
 
 def test_rope_matches_pytorch():
     from solution import rope
@@ -134,6 +136,7 @@ def test_rope_matches_pytorch():
     torch.testing.assert_close(ke, kr, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(q.grad.float(), q2.grad.float(), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(k.grad.float(), k2.grad.float(), rtol=1e-2, atol=1e-2)
+
 
 def test_add_rmsnorm_matches_pytorch():
     from solution import rmsnorm

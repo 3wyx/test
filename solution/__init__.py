@@ -13,10 +13,12 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .compact import patch_compact
 from .patches import apply_all
+from .swiglu import patch_qwen2_mlp
 
 
 def apply():
-    # Keep the example disabled: it does not count as your own kernel and it wastes training time.
-    # The real performance win comes from the fused loss + NF4 + safe fast paths.
+    patch_qwen2_mlp()
     apply_all()
+    patch_compact()

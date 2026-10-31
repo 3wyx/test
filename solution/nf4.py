@@ -12,14 +12,13 @@ import torch
 import triton
 import triton.language as tl
 
-# The 16 NormalFloat4 code values (QLoRA paper, appendix E).
 NF4_CODE = (-1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
             -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
             0.07958029955625534, 0.16093020141506195, 0.24611230194568634, 0.33791524171829224,
             0.44070982933044434, 0.5626170039558105, 0.7229568362236999, 1.0)
 BLOCKSIZE = 64
-BLOCK = 4096
-NUM_WARPS = 8
+BLOCK = 1024
+NUM_WARPS = 4
 
 _codes = {}
 
@@ -30,14 +29,11 @@ def _nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, n_byte
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_range = offs < n_bytes
     packed = tl.load(packed_ptr + offs, mask=in_range, other=0).to(tl.int32)
-    scales = tl.load(absmax_ptr + offs // 32, mask=in_range, other=0.0)
-
-    # Keep the arithmetic straightforward and cache-friendly for the T4 path.
-    hi = tl.load(code_ptr + (packed >> 4)) * scales
-    lo = tl.load(code_ptr + (packed & 15)) * scales
-
+    scale = tl.load(absmax_ptr + offs // 32, mask=in_range, other=0.0)
+    high = tl.load(code_ptr + (packed >> 4)) * scale
+    low = tl.load(code_ptr + (packed & 15)) * scale
     pair = tl.arange(0, 2)[None, :]
-    vals = tl.where(pair == 0, hi[:, None], lo[:, None])
+    vals = tl.where(pair == 0, high[:, None], low[:, None])
     out_offs = offs[:, None] * 2 + pair
     tl.store(out_ptr + out_offs, vals.to(out_ptr.dtype.element_ty), mask=out_offs < n_out)
 
@@ -50,8 +46,6 @@ def _code_table(device):
 
 
 def dequantize_nf4(packed, absmax, out):
-    packed = packed.contiguous() if not packed.is_contiguous() else packed
-    absmax = absmax.contiguous() if not absmax.is_contiguous() else absmax
     n_out = out.numel()
     n_bytes = (n_out + 1) // 2
     grid = (triton.cdiv(n_bytes, BLOCK),)
@@ -66,9 +60,7 @@ def make_dequant(original):
         if (quant_type == "nf4" and blocksize == BLOCKSIZE and torch.is_tensor(A) and A.is_cuda
                 and out.is_cuda and out.is_contiguous() and absmax.dtype == torch.float32
                 and out.dtype in (torch.float16, torch.bfloat16, torch.float32)):
-            # Keep the custom path, but avoid redundant copies when the caller already supplied
-            # contiguous inputs; the kernel itself is the main speed-up.
-            dequantize_nf4(A, absmax, out)
+            dequantize_nf4(A.contiguous(), absmax.contiguous(), out)
             return None
         return original(A, absmax, blocksize, quant_type, dtype, out)
 

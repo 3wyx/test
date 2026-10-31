@@ -6,7 +6,8 @@ shifted logits to take an argmax, and Soup computes a loss for every row again f
 
 Here ONE forward kernel reads each logits row once and produces everything those places need:
 log-sum-exp, the token loss, the entropy and "argmax == label". ONE backward kernel writes the
-gradient of the logits straight from the saved log-sum-exp, without a softmax / one-hot copy.
+gradient of the logits straight from the saved log-sum-exp, without a softmax / one-hot copy,
+and it writes it over the logits themselves (no second logits-sized buffer).
 The small per-token results are kept in `_SIDE`, so the patched TRL metric code and the patched
 Soup rewind code reuse them instead of reading the logits again (see `patches.py`).
 """
@@ -19,13 +20,12 @@ import triton.language as tl
 BLOCK = 4096
 NUM_WARPS = 8
 
-# The per-token results of the latest forward pass (a few KB, never the logits themselves).
 _SIDE = {}
 
 
 @triton.jit
 def _fused_ce_fwd_kernel(logits_ptr, target_ptr, lse_ptr, tokloss_ptr, entropy_ptr, correct_ptr,
-                          V, stride, BLOCK: tl.constexpr):
+                         V, stride, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     base = logits_ptr + row.to(tl.int64) * stride
     target = tl.load(target_ptr + row)
@@ -67,7 +67,7 @@ def _fused_ce_fwd_kernel(logits_ptr, target_ptr, lse_ptr, tokloss_ptr, entropy_p
 
 @triton.jit
 def _fused_ce_bwd_kernel(logits_ptr, dlogits_ptr, target_ptr, lse_ptr, scale_ptr, V, stride,
-                          BLOCK: tl.constexpr):
+                         BLOCK: tl.constexpr):
     row = tl.program_id(0)
     offset = row.to(tl.int64) * stride
     target = tl.load(target_ptr + row)
@@ -96,31 +96,24 @@ class _FusedCE(torch.autograd.Function):
         tokloss = torch.empty(n, dtype=torch.float32, device=device)
         entropy = torch.empty(n, dtype=torch.float32, device=device)
         correct = torch.empty(n, dtype=torch.int8, device=device)
-
         _fused_ce_fwd_kernel[(n,)](logits, targets, lse, tokloss, entropy, correct, vocab,
-                                    logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
-
-        # Keep the cached metadata minimal and safe: only values reused by TRL/Soup metrics.
+                                   logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
         _SIDE.clear()
         _SIDE.update(batch=batch, length=length, vocab=vocab,
                      tokloss=tokloss.view(batch, length),
                      entropy=entropy.view(batch, length),
                      correct=correct.view(batch, length))
-
-        ctx.save_for_backward(logits, targets, lse)
-        ctx.denom = float(denom)
+        ctx.save_for_backward(logits, targets, lse, denom)
         return tokloss.sum() / denom
 
     @staticmethod
     def backward(ctx, grad_out):
-        logits, targets, lse = ctx.saved_tensors
+        logits, targets, lse, denom = ctx.saved_tensors
         n, vocab = logits.shape
-        dlogits = torch.empty_like(logits)
-        scale = grad_out.to(torch.float32) / ctx.denom
-        scale = scale.reshape(1).contiguous()
-        _fused_ce_bwd_kernel[(n,)](logits, dlogits, targets, lse, scale, vocab, logits.stride(0),
-                                    BLOCK=BLOCK, num_warps=NUM_WARPS)
-        return dlogits, None, None, None, None
+        scale = (grad_out.to(torch.float32) / denom).reshape(1).contiguous()
+        _fused_ce_bwd_kernel[(n,)](logits, logits, targets, lse, scale, vocab, logits.stride(0),
+                                   BLOCK=BLOCK, num_warps=NUM_WARPS)
+        return logits, None, None, None, None
 
 
 def lookup(logits):
@@ -143,7 +136,7 @@ def make_loss(original):
     """Build the replacement of transformers' ForCausalLMLoss (same signature)."""
 
     def fused_for_causal_lm_loss(logits, labels, vocab_size, num_items_in_batch=None,
-                                  ignore_index=-100, shift_labels=None, **kwargs):
+                                 ignore_index=-100, shift_labels=None, **kwargs):
         if (not torch.is_tensor(logits) or not logits.is_cuda or logits.dim() != 3
                 or ignore_index != -100 or logits.shape[-1] != vocab_size):
             return original(logits, labels, vocab_size, num_items_in_batch, ignore_index,
