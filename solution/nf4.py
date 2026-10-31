@@ -33,7 +33,7 @@ def _nf4_dequant_block_kernel(
     low = packed & 0x0F
     high = (packed >> 4) & 0x0F
 
-    scale_idx = (offs_k // BLOCKSIZE)
+    scale_idx = offs_k // BLOCKSIZE
     scale = tl.load(absmax_ptr + scale_idx, mask=(scale_idx < (K // BLOCKSIZE)), other=0.0).to(tl.float32)
 
     low_val = tl.load(code_ptr + low, mask=(low < 16), other=0.0).to(tl.float32)
@@ -94,7 +94,7 @@ def _nf4_matmul_fused_kernel(
         code_low = tl.load(code_ptr + low, mask=(low < 16), other=0.0).to(tl.float32)
         code_high = tl.load(code_ptr + high, mask=(high < 16), other=0.0).to(tl.float32)
 
-        even = (offs_k % 2 == 0)
+        even = offs_k % 2 == 0
         vals = tl.where(even[None, :], code_high, code_low)
 
         scale_idx = offs_k // BLOCKSIZE
@@ -116,34 +116,18 @@ def _nf4_absmax_from_quant_state(quant_state):
 
 
 def _normalize_nf4_weight_layout(weight, quant_state):
-    """Convert a transposed packed weight back to the canonical stored orientation.
+    """Restore the packed NF4 weight to canonical storage before dequantization.
 
-    bitsandbytes uses `quant_w.t()` in the matmul call, but the packed NF4 data itself must
-    be dequantized as if it were stored in its original row-major orientation. If we keep the
-    transposed view as-is, we effectively dequantize the wrong matrix layout and get the tiny
-    one-element drift seen in the failing test.
+    bitsandbytes callers often pass `quant_w.t()` into `matmul_4bit`. The packed NF4 data
+    itself is stored in the original orientation, so a transposed view must be flipped back
+    before dequantization. Doing it twice produces a 1-element drift at the edge of tolerance,
+    which is exactly what the failing NF4 matmul test is seeing.
     """
     weight = weight.contiguous()
     if weight.dim() == 2 and weight.shape == quant_state.shape:
-        # A transposed view has stride (1, rows). Convert it back to canonical packed layout
-        # before dequantizing. We do not want to dequantize a transposed view directly.
         if weight.stride(0) == 1 and weight.stride(1) == weight.shape[0]:
             return weight.t().contiguous()
     return weight
-
-
-def _dequantize_nf4_blockwise(weight, quant_state, dtype):
-    import bitsandbytes.functional as bnb_F
-
-    weight = _normalize_nf4_weight_layout(weight, quant_state)
-    return bnb_F.dequantize_4bit(
-        weight,
-        quant_state=quant_state,
-        absmax=None,
-        out=None,
-        blocksize=int(quant_state.blocksize),
-        quant_type=getattr(quant_state, "quant_type", "nf4"),
-    ).to(dtype)
 
 
 def _quantized_nf4_to_dense_blockwise(weight, quant_state, dtype=torch.float16):
@@ -187,7 +171,8 @@ class TritonNF4MatMul(torch.autograd.Function):
         else:
             out.copy_(torch.empty_like(out))
 
-        w_deq = _dequantize_nf4_blockwise(B, quant_state, dtype=A.dtype)
+        B_norm = _normalize_nf4_weight_layout(B, quant_state)
+        w_deq = _dequantize_nf4_blockwise(B_norm, quant_state, dtype=A.dtype)
         out.copy_(torch.matmul(A, w_deq))
 
         if bias is not None:
@@ -198,7 +183,8 @@ class TritonNF4MatMul(torch.autograd.Function):
     def backward(ctx, grad_output):
         (B,) = ctx.saved_tensors
         quant_state = ctx.quant_state
-        w_deq = _dequantize_nf4_blockwise(B, quant_state, dtype=grad_output.dtype)
+        B_norm = _normalize_nf4_weight_layout(B, quant_state)
+        w_deq = _dequantize_nf4_blockwise(B_norm, quant_state, dtype=grad_output.dtype)
         grad_A = torch.matmul(grad_output, w_deq.transpose(0, 1))
         grad_bias = None
         if ctx.has_bias:
@@ -244,6 +230,30 @@ def _recover_nf4_scales(quant_state, n_blocks, device):
     return absmax.to(device=device, dtype=torch.float32).reshape(-1)
 
 
+def _dequantize_nf4_blockwise(weight, quant_state, dtype):
+    weight = _normalize_nf4_weight_layout(weight, quant_state)
+    out_shape = quant_state.shape
+    total = int(out_shape.numel())
+    blocksize = int(quant_state.blocksize)
+    n_blocks = (total + blocksize - 1) // blocksize
+
+    code = quant_state.code.to(device=weight.device, dtype=dtype)
+    scales = _recover_nf4_scales(quant_state, n_blocks, weight.device).to(device=weight.device, dtype=dtype)
+
+    packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.uint8)
+    if packed.numel() % 2 != 0:
+        packed = F.pad(packed, (0, 1))
+
+    lo = (packed & 0x0F).to(torch.long)
+    hi = ((packed >> 4) & 0x0F).to(torch.long)
+
+    vals = torch.empty(packed.numel() * 2, device=weight.device, dtype=dtype)
+    vals[0::2] = code[hi]
+    vals[1::2] = code[lo]
+    vals = vals[:total].view(n_blocks, blocksize) * scales.view(-1, 1)
+    return vals.reshape(out_shape)
+
+
 def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
     out_shape = quant_state.shape
     out_dtype = dtype if dtype is not None else quant_state.dtype
@@ -256,19 +266,24 @@ def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
     else:
         out = out.to(device=weight.device, dtype=out_dtype)
 
-    # Exact match to bitsandbytes. Do not reinterpret a transposed packed view as the canonical
-    # dequantization layout; that is the source of the tiny one-element mismatch in matmul tests.
-    import bitsandbytes.functional as bnb_F
+    weight = _normalize_nf4_weight_layout(weight, quant_state)
+    packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.int64)
+    if packed.numel() * 2 < total:
+        packed = F.pad(packed, (0, total // 2 - packed.numel()))
 
-    ref = bnb_F.dequantize_4bit(
-        _normalize_nf4_weight_layout(weight, quant_state),
-        quant_state=quant_state,
-        absmax=None,
-        out=out,
-        blocksize=blocksize,
-        quant_type=getattr(quant_state, "quant_type", "nf4"),
-    )
-    return ref
+    hi = ((packed >> 4) & 0x0F).to(torch.long)
+    lo = (packed & 0x0F).to(torch.long)
+    code = quant_state.code.to(device=weight.device, dtype=torch.float32)
+
+    values = torch.empty(packed.numel() * 2, device=weight.device, dtype=torch.float32)
+    values[0::2] = code[hi]
+    values[1::2] = code[lo]
+    values = values[:total].reshape(n_blocks, blocksize)
+
+    scales = _recover_nf4_scales(quant_state, n_blocks, weight.device)
+    deq = values * scales.view(-1, 1)
+    out.copy_(deq.reshape(out_shape).to(out.dtype))
+    return out
 
 
 def _dequantize_nf4_scratch(weight, quant_state, dtype):
