@@ -25,16 +25,16 @@ _SIDE = {}
 
 @triton.jit
 def _fused_ce_fwd_kernel(logits_ptr, target_ptr, lse_ptr, tokloss_ptr, entropy_ptr, correct_ptr,
-                         V, stride, BLOCK: tl.constexpr):
+                          V, stride, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     base = logits_ptr + row.to(tl.int64) * stride
     target = tl.load(target_ptr + row)
 
-    m = float("-inf")  # running max
-    s = 0.0  # running sum of exp(x - m)
-    t = 0.0  # running sum of exp(x - m) * x
-    best = float("-inf")  # largest logit so far
-    best_idx = 0  # its index
+    m = float("-inf")
+    s = 0.0
+    t = 0.0
+    best = float("-inf")
+    best_idx = 0
     target_logit = 0.0
 
     for start in range(0, V, BLOCK):
@@ -45,7 +45,7 @@ def _fused_ce_fwd_kernel(logits_ptr, target_ptr, lse_ptr, tokloss_ptr, entropy_p
         block_max = tl.max(x, 0)
         m_new = tl.maximum(m, block_max)
         alpha = tl.exp(m - m_new)
-        e = tl.exp(x - m_new)  # 0 on masked lanes
+        e = tl.exp(x - m_new)
         x_safe = tl.where(mask, x, 0.0)
         s = s * alpha + tl.sum(e, 0)
         t = t * alpha + tl.sum(e * x_safe, 0)
@@ -62,12 +62,12 @@ def _fused_ce_fwd_kernel(logits_ptr, target_ptr, lse_ptr, tokloss_ptr, entropy_p
     tl.store(lse_ptr + row, lse)
     tl.store(entropy_ptr + row, lse - t / s)
     tl.store(tokloss_ptr + row, tl.where(valid, lse - target_logit, 0.0))
-    tl.store(correct_ptr + row, ((best_idx == target) & valid).to(tl.int32))
+    tl.store(correct_ptr + row, ((best_idx == target) & valid).to(tl.int8))
 
 
 @triton.jit
 def _fused_ce_bwd_kernel(logits_ptr, dlogits_ptr, target_ptr, lse_ptr, scale_ptr, V, stride,
-                         BLOCK: tl.constexpr):
+                          BLOCK: tl.constexpr):
     row = tl.program_id(0)
     offset = row.to(tl.int64) * stride
     target = tl.load(target_ptr + row)
@@ -95,24 +95,26 @@ class _FusedCE(torch.autograd.Function):
         lse = torch.empty(n, dtype=torch.float32, device=device)
         tokloss = torch.empty(n, dtype=torch.float32, device=device)
         entropy = torch.empty(n, dtype=torch.float32, device=device)
-        correct = torch.empty(n, dtype=torch.int32, device=device)
+        correct = torch.empty(n, dtype=torch.int8, device=device)
         _fused_ce_fwd_kernel[(n,)](logits, targets, lse, tokloss, entropy, correct, vocab,
-                                   logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
+                                    logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
         _SIDE.clear()
-        _SIDE.update(ptr=logits.data_ptr(), numel=logits.numel(), vocab=vocab, batch=batch,
-                     length=length, tokloss=tokloss.view(batch, length),
-                     entropy=entropy.view(batch, length), correct=correct.view(batch, length))
-        ctx.save_for_backward(logits, targets, lse, denom)
+        _SIDE.update(batch=batch, length=length, vocab=vocab,
+                     tokloss=tokloss.view(batch, length),
+                     entropy=entropy.view(batch, length),
+                     correct=correct.view(batch, length))
+        ctx.save_for_backward(logits, targets, lse)
+        ctx.denom = float(denom)
         return tokloss.sum() / denom
 
     @staticmethod
     def backward(ctx, grad_out):
-        logits, targets, lse, denom = ctx.saved_tensors
+        logits, targets, lse = ctx.saved_tensors
         n, vocab = logits.shape
-        dlogits = logits
-        scale = (grad_out.to(torch.float32) / denom).reshape(1).contiguous()
-        _fused_ce_bwd_kernel[(n,)](logits, dlogits, targets, lse, scale, vocab, logits.stride(0),
-                                   BLOCK=BLOCK, num_warps=NUM_WARPS)
+        dlogits = torch.empty_like(logits)
+        scale = grad_out.to(torch.float32) / ctx.denom
+        _fused_ce_bwd_kernel[(n,)](logits, dlogits, targets, lse, scale.reshape(1).contiguous(),
+                                    vocab, logits.stride(0), BLOCK=BLOCK, num_warps=NUM_WARPS)
         return dlogits, None, None, None, None
 
 
@@ -136,7 +138,7 @@ def make_loss(original):
     """Build the replacement of transformers' ForCausalLMLoss (same signature)."""
 
     def fused_for_causal_lm_loss(logits, labels, vocab_size, num_items_in_batch=None,
-                                 ignore_index=-100, shift_labels=None, **kwargs):
+                                  ignore_index=-100, shift_labels=None, **kwargs):
         if (not torch.is_tensor(logits) or not logits.is_cuda or logits.dim() != 3
                 or ignore_index != -100 or logits.shape[-1] != vocab_size):
             return original(logits, labels, vocab_size, num_items_in_batch, ignore_index,
