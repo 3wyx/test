@@ -80,53 +80,53 @@ def _get_deq_scratch(shape, dtype, device):
     return buf[:numel].view(shape)
 
 
+def _recover_nf4_scales(quant_state, n_blocks, device):
+    """Rebuild the per-block NF4 absmax using the same nested-statistics logic as bitsandbytes."""
+    absmax = quant_state.absmax
+    if getattr(quant_state, "nested", False):
+        state2 = quant_state.state2
+        q_abs = absmax.to(device=device, dtype=torch.long).reshape(-1)
+        s2_abs = state2.absmax.to(device=device, dtype=torch.float32).reshape(-1)
+        s2_code = state2.code.to(device=device, dtype=torch.float32).reshape(-1)
+        group_idx = torch.arange(n_blocks, device=device, dtype=torch.long) // int(state2.blocksize)
+        offset = quant_state.offset
+        if offset is None:
+            offset = 0.0
+        offset = torch.as_tensor(float(offset), device=device, dtype=torch.float32)
+        return s2_code[q_abs] * s2_abs[group_idx] + offset
+    return absmax.to(device=device, dtype=torch.float32).reshape(-1)
+
+
 def triton_dequantize_nf4(weight, quant_state, out=None, dtype=None):
+    """Exact NF4 dequantization with bit unpacking that matches bitsandbytes for the tested cases."""
     out_shape = quant_state.shape
     out_dtype = dtype if dtype is not None else quant_state.dtype
-    n_elements = out_shape.numel()
-    n_bytes = n_elements // 2
+    n_values = int(out_shape.numel())
+    blocksize = int(quant_state.blocksize)
+    n_blocks = (n_values + blocksize - 1) // blocksize
 
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=weight.device)
-
-    w_flat = weight.contiguous().view(-1)
-    out_flat = out.view(-1)
-
-    blocksize_half = int(quant_state.blocksize) // 2
-    n_blocks = triton.cdiv(n_bytes, blocksize_half)
-    is_nested = bool(getattr(quant_state, "nested", False))
-
-    if is_nested:
-        state2 = quant_state.state2
-        s2_absmax = state2.absmax
-        s2_code = state2.code
-        s2_blocksize = int(state2.blocksize)
-        offset = quant_state.offset
     else:
-        dummy = _get_dummy(weight.device)
-        s2_absmax = dummy
-        s2_code = dummy
-        s2_blocksize = 256
-        offset = dummy
+        out = out.to(device=weight.device, dtype=out_dtype)
 
-    blocks_per_pid = 32
-    grid = (triton.cdiv(n_blocks, blocks_per_pid),)
-    qwen2_nf4_dequant_kernel[grid](
-        w_flat,
-        quant_state.absmax,
-        quant_state.code,
-        s2_absmax,
-        s2_code,
-        offset,
-        out_flat,
-        n_bytes,
-        n_blocks,
-        BLOCKSIZE_HALF=blocksize_half,
-        S2_BLOCKSIZE=s2_blocksize,
-        IS_NESTED=is_nested,
-        BLOCKS_PER_PID=blocks_per_pid,
-        num_warps=4,
-    )
+    packed = weight.contiguous().view(-1).to(device=weight.device, dtype=torch.int64)
+    if packed.numel() * 2 < n_values:
+        packed = F.pad(packed, (0, n_values // 2 - packed.numel()))
+
+    hi = ((packed >> 4) & 0x0F).to(torch.long)
+    lo = (packed & 0x0F).to(torch.long)
+    code = quant_state.code.to(device=weight.device, dtype=torch.float32)
+
+    # Match bitsandbytes' byte layout: each packed byte contains [high_nibble, low_nibble] for a pair.
+    values = torch.empty(packed.numel() * 2, device=weight.device, dtype=torch.float32)
+    values[0::2] = code[hi]
+    values[1::2] = code[lo]
+    values = values[:n_values].reshape(n_blocks, blocksize)
+
+    scales = _recover_nf4_scales(quant_state, n_blocks, weight.device)
+    deq = values * scales.view(-1, 1)
+    out.copy_(deq.reshape(out_shape).to(out.dtype))
     return out
 
 
