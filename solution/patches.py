@@ -17,7 +17,7 @@ from collections.abc import Mapping
 
 import torch
 
-from . import fused_loss, nf4, rmsnorm, rope
+from . import fused_loss, lora_fast, nf4, rmsnorm, rope
 
 
 def _warn(what, exc):
@@ -171,11 +171,20 @@ def patch_qwen2_rope():
         return
     qwen2.apply_rotary_pos_emb = rope.make_rope(original)
 
+def patch_lora_forward():
+    from peft.tuners.lora import bnb as peft_bnb
+
+    original = peft_bnb.Linear4bit.forward
+    if getattr(original, "_is_fused", False):
+        return
+    peft_bnb.Linear4bit.forward = lora_fast.make_forward(original)
+   
 def apply_all():
     for name, patch in (("NF4 dequant", patch_nf4_dequant),
                         ("RMSNorm", patch_qwen2_rmsnorm),
                         ("decoder layer add+norm", patch_qwen2_decoder_layer),
                         ("RoPE", patch_qwen2_rope),
+                        ("LoRA addmm", patch_lora_forward),
                         ("accelerate fp32 logits", patch_accelerate_fp32_logits),
                         ("transformers loss", patch_transformers_loss),
                         ("TRL compute_loss", patch_trl_compute_loss),
